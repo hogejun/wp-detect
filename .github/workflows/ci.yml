@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Sync dependencies (incl. dev)
+        run: uv sync --dev
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Registry holds exactly the two built-ins
+        run: |
+          uv run python - <<'PY'
+          from wp_detect.checks import registry
+          got = set(registry)
+          assert got == {"detect", "headers"}, f"registry = {sorted(got)}"
+          PY
+
+      - name: Smoke-test CLI
+        run: uv run wp-detect --list-checks
+
+      - name: Build package
+        run: uv build
+
+  # Guards: no internal information may enter the published tree or history.
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0  # commit-lint needs the PR range's history
+
+      - name: Scan tree for forbidden terms
+        run: bash scripts/ci/forbidden-scan.sh
+
+      - name: Lint PR commit identities and messages
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/ci/commit-lint.sh
+
+      # Also check what actually lands on main (the squash-merge commit, whose
+      # author/committer/auto-added co-author trailers differ from the PR head).
+      - name: Lint pushed commit(s) on main
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if printf '%s' "$BEFORE" | grep -qE '^0+$'; then
+            range="$AFTER"              # new branch / first commit: check it alone
+          else
+            range="$BEFORE..$AFTER"
+          fi
+          RANGE="$range" bash scripts/ci/commit-lint.sh
+
+  # Independent secret scan, beyond the term-dictionary forbidden-scan above.
+  # Fail-closed: a non-zero gitleaks exit (finding or error) fails the step.
+  secret-scan:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0  # gitleaks git scans the full history
+
+      - name: Install gitleaks (pinned)
+        run: |
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          rm -f gitleaks gitleaks.tar.gz
+          gitleaks version
+
+      - name: Scan working tree for secrets
+        run: gitleaks dir . --no-banner --redact
+
+      - name: Scan git history for secrets
+        run: gitleaks git . --no-banner --redact
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Lint workflows
+        run: actionlint -color

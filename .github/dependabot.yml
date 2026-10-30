@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Keep the SHA-pinned GitHub Actions current via managed update PRs —
+  # minor/patch only. Major bumps (often breaking: Node runtime, input/output
+  # changes) are excluded; review and bump those deliberately when wanted.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]

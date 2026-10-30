@@ -1,0 +1,3 @@
+/Users/someone/project
+-----BEGIN RSA PRIVATE KEY-----
+AKIAIOSFODNN7EXAMPLE
