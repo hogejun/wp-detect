@@ -245,6 +245,14 @@ class Response:
     elapsed: float
     # Raw Set-Cookie lines, preserved individually (a dict would collapse them).
     set_cookies: list[str] = field(default_factory=list)
+    # The response body bytes (post transfer-decoding, the same bytes ``text`` is
+    # decoded from — not the compressed wire bytes), capped at ``max_body_bytes``;
+    # the encoding used to decode ``text``; and whether the body exceeded the cap.
+    # Lets a caller measure an exact byte length or decode strictly rather than
+    # re-encode ``text`` as an approximation.
+    content: bytes = b""
+    encoding: str | None = None
+    truncated: bool = False
 
     def header(self, name: str) -> str | None:
         return self.headers.get(name.lower())
@@ -388,20 +396,28 @@ class Client:
                     url = next_url
                     continue
 
-                # Final response: read the body, capped.
+                # Final response: read the body, capped. Keep bytes up to the cap
+                # (slicing the chunk that would cross it) rather than dropping a
+                # whole over-cap chunk, so `data` is exactly the first
+                # `max_body_bytes` received.
                 chunks: list[bytes] = []
                 total = 0
+                truncated = False
                 for chunk in resp.iter_bytes():
-                    total += len(chunk)
-                    if total <= self.max_body_bytes:
+                    remaining = self.max_body_bytes - total
+                    if len(chunk) <= remaining:
                         chunks.append(chunk)
+                        total += len(chunk)
                     else:
+                        chunks.append(chunk[:remaining])  # fill up to the cap
+                        truncated = True
                         break
                 data = b"".join(chunks)
                 elapsed = time.monotonic() - start
                 self._last_request = time.monotonic()
                 # Decode defensively; sites lie about encodings.
-                text = data.decode(resp.encoding or "utf-8", errors="replace")
+                encoding = resp.encoding or "utf-8"
+                text = data.decode(encoding, errors="replace")
                 resp_headers = {k.lower(): v for k, v in resp.headers.items()}
                 # Preserve each Set-Cookie line (the dict above keeps only one).
                 set_cookies = list(resp.headers.get_list("set-cookie"))
@@ -412,6 +428,9 @@ class Client:
                     text=text,
                     elapsed=elapsed,
                     set_cookies=set_cookies,
+                    content=data,
+                    encoding=encoding,
+                    truncated=truncated,
                 )
 
     def get(self, path: str) -> Response:
