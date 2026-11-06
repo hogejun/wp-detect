@@ -10,7 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from wp_detect.http import BudgetExceeded, Client
+from wp_detect.http import Client
 
 BASE = "https://site.test/"
 
@@ -58,16 +58,18 @@ def _reset(request):
 @pytest.mark.parametrize("exc", [_connect_timeout, _read_timeout, _reset])
 def test_single_transient_is_retried_and_recovers(exc) -> None:
     h = _fail_then_ok(1, exc)
-    c = _client(h)  # default max_retries=1
+    c = _client(h, max_retries=1)
     resp = c.get("/a")
     assert resp.status == 200
     assert h.calls["n"] == 2            # one failure + one success
     assert c.request_count == 2         # every attempt counts against the budget
 
 
-def test_no_retry_when_disabled() -> None:
+def test_retry_is_opt_in_off_by_default() -> None:
+    # Default max_retries=0: the transient error propagates with no retry, so
+    # existing callers see no behavior change.
     h = _fail_then_ok(1, _connect_timeout)
-    c = _client(h, max_retries=0)
+    c = _client(h)  # no max_retries -> default 0
     with pytest.raises(httpx.ConnectTimeout):
         c.get("/a")
     assert h.calls["n"] == 1
@@ -114,6 +116,18 @@ def test_non_transient_exception_is_not_retried() -> None:
         c.get("/a")
 
 
+def test_connect_error_is_excluded_and_not_retried() -> None:
+    # ConnectError (TLS verify failure / DNS / connection-refused) is permanent,
+    # not transport-transient, so it is NOT retried even with retries enabled.
+    def _h(request):
+        raise httpx.ConnectError("certificate verify failed", request=request)
+
+    c = _client(_h, max_retries=3)
+    with pytest.raises(httpx.ConnectError):
+        c.get("/a")
+    assert c.request_count == 1
+
+
 def test_non_idempotent_method_is_not_retried() -> None:
     h = _fail_then_ok(1, _reset)
     c = _client(h, max_retries=3)
@@ -122,14 +136,24 @@ def test_non_idempotent_method_is_not_retried() -> None:
     assert h.calls["n"] == 1            # POST is not idempotent -> no retry
 
 
-def test_retry_still_respects_budget() -> None:
-    # Budget of 1: the first attempt consumes it, so a retry hits BudgetExceeded
-    # (which is not a transient error) rather than looping.
+def test_body_bearing_request_is_not_retried_even_if_method_safe() -> None:
+    # A body-bearing probe must not be replayed regardless of method.
+    h = _fail_then_ok(1, _reset)
+    c = _client(h, max_retries=3)
+    with pytest.raises(httpx.ReadError):
+        c.request_body("OPTIONS", "/x", "<x/>", content_type="text/xml")
+    assert h.calls["n"] == 1
+
+
+def test_retry_not_attempted_when_budget_exhausted(_no_sleep) -> None:
+    # Budget of 1: the first attempt consumes it, so there is no room to retry.
+    # The transient error propagates and NO backoff is slept.
     h = _fail_then_ok(99, _connect_timeout)
     c = _client(h, max_retries=5, max_requests=1)
-    with pytest.raises(BudgetExceeded):
+    with pytest.raises(httpx.ConnectTimeout):
         c.get("/a")
     assert c.request_count == 1
+    assert _no_sleep == []              # no sleep after the budget is out
 
 
 # -- backoff -------------------------------------------------------------

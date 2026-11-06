@@ -14,10 +14,11 @@ Design goals:
     keep the scanner from hammering a site; every redirect hop counts against
     the budget and is throttled too. This is a *detector*, not a stress tool.
   * **Resilient, not aggressive.** A transient transport failure (connect/read
-    timeout, connection reset) is retried a small, bounded number of times
-    (default one) for idempotent methods, after an exponential backoff, so a
-    brief throttle window does not abort a whole check. Every attempt still
-    counts against the request budget, so retries never make a scan unbounded.
+    timeout, connection reset) can optionally be retried a small, bounded number
+    of times for idempotent, body-free requests, after an exponential backoff, so
+    a brief throttle window need not abort a whole check. The retry is opt-in
+    (``max_retries`` defaults to 0), and every attempt still counts against the
+    request budget, so retries never make a scan unbounded.
 """
 
 from __future__ import annotations
@@ -79,16 +80,23 @@ class TooManyRedirects(RuntimeError):
 # 3xx statuses that carry a Location we may follow (same-origin only).
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 
-# Transient transport failures that a single bounded retry may recover from:
-# connect/read/write/pool timeouts, connect failures, and read/write/remote-
-# protocol errors (a connection reset or a keep-alive connection the peer closed
-# mid-response). These are intermittent under per-IP rate limiting or a WAF; the
-# same request usually succeeds a moment later. NOT included: BudgetExceeded,
-# OffOriginRedirect, TooManyRedirects (our own control signals) and any HTTP
-# status (not an exception) — none of those are transport-transient.
+# Transient transport failures a single bounded retry may recover from. These
+# CAN be intermittent when a host rate-limits per IP or runs a WAF (a plausible
+# cause of the timeouts/resets we see, not an established one); the same request
+# often succeeds a moment later.
+#   * any timeout (connect/read/write/pool) — httpx.TimeoutException,
+#   * a read/write transport error or a remote-protocol error, i.e. the peer
+#     dropped the connection or closed an idle keep-alive mid-response.
+# Deliberately EXCLUDED so a permanent failure is not masked:
+#   * httpx.ConnectError — covers TLS certificate verification failures, DNS
+#     failures and connection-refused, which are not transport-transient (a
+#     connect *timeout* is a TimeoutException and IS covered);
+#   * BudgetExceeded / OffOriginRedirect / TooManyRedirects (our own control
+#     signals) and any HTTP status (not an exception).
+# Heuristic note: a ReadError does not *prove* a transient reset, but the retry
+# is bounded and budget-counted, so at worst it spends one extra attempt.
 _TRANSIENT_ERRORS = (
     httpx.TimeoutException,
-    httpx.ConnectError,
     httpx.ReadError,
     httpx.WriteError,
     httpx.RemoteProtocolError,
@@ -297,7 +305,7 @@ class Client:
         verify_tls: bool = True,
         user_agent: str = DEFAULT_USER_AGENT,
         max_body_bytes: int = 1_000_000,
-        max_retries: int = 1,
+        max_retries: int = 0,
         retry_backoff: float = 0.5,
         retry_backoff_max: float = 4.0,
         transport: httpx.BaseTransport | None = None,
@@ -313,9 +321,10 @@ class Client:
         # Bounded retry for transient transport errors (see _TRANSIENT_ERRORS):
         # at most ``max_retries`` extra attempts per request, each after an
         # exponential backoff of ``retry_backoff * 2**n`` seconds capped at
-        # ``retry_backoff_max``. Default is one retry — enough to ride out a brief
-        # throttle window, small enough not to mask a real failure or amplify load.
-        # Every attempt (including a retry) still counts against ``max_requests``.
+        # ``retry_backoff_max``. Default is 0 — the retry is OPT-IN, so this change
+        # does not alter existing behavior; a caller enables it explicitly. Every
+        # attempt (including a retry) still counts against ``max_requests``, and a
+        # retry is never attempted (nor its backoff slept) once the budget is out.
         self.max_retries = max(0, max_retries)
         self.retry_backoff = max(0.0, retry_backoff)
         self.retry_backoff_max = max(0.0, retry_backoff_max)
@@ -437,16 +446,27 @@ class Client:
 
         Returns ``("final", Response)`` or ``("redirect", (status, location))``.
         A transient transport error (``_TRANSIENT_ERRORS``) is retried up to
-        ``max_retries`` times for idempotent methods only, after an exponential
-        backoff. Non-transient failures — BudgetExceeded, off-origin/too-many
-        redirects, any HTTP status — are not caught here and propagate unchanged.
-        A retried attempt is counted against the budget by ``_attempt_once``."""
+        ``max_retries`` times, and ONLY when the request is safe to replay and
+        the budget allows it:
+          * an idempotent method (GET/HEAD/OPTIONS), AND
+          * no request body (never replay a body-bearing probe, whatever its
+            method), AND
+          * ``request_count`` still below ``max_requests`` — so no backoff is
+            slept once the budget is out; the transient error then propagates.
+        Non-transient failures — BudgetExceeded, off-origin/too-many redirects,
+        any HTTP status — are not caught here and propagate unchanged. A retried
+        attempt is counted against the budget by ``_attempt_once``."""
         attempt = 0
         while True:
             try:
                 return self._attempt_once(method, url, content, content_type)
             except _TRANSIENT_ERRORS:
-                if attempt >= self.max_retries or method.upper() not in _IDEMPOTENT_METHODS:
+                if (
+                    attempt >= self.max_retries
+                    or method.upper() not in _IDEMPOTENT_METHODS
+                    or content is not None
+                    or self.request_count >= self.max_requests
+                ):
                     raise
                 attempt += 1
                 self._backoff_sleep(attempt)
