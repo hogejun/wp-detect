@@ -225,3 +225,15 @@ def test_timeout_during_body_read_is_retried() -> None:
     assert resp.status == 200 and resp.text == "OK"
     assert calls["n"] == 2            # the mid-stream failure was retried
     assert c.request_count == 2
+
+
+def test_failed_attempt_updates_last_request_for_spacing() -> None:
+    # A failed attempt must advance _last_request so the normal inter-request
+    # throttle spaces the retry from the failure (not only from the last success),
+    # which matters when retry_backoff is 0.
+    h = _fail_then_ok(1, _reset)
+    c = _client(h, max_retries=0)  # single failing attempt, no retry
+    assert c._last_request == 0.0
+    with pytest.raises(httpx.ReadError):
+        c.get("/a")
+    assert c._last_request > 0.0

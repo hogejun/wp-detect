@@ -483,50 +483,56 @@ class Client:
         self.request_count += 1
         start = time.monotonic()
         headers = {"Content-Type": content_type} if content_type else None
-        with self._client.stream(method, url, content=content, headers=headers) as resp:
-            status = resp.status_code
-            location = resp.headers.get("location")
-            if status in _REDIRECT_CODES and location:
-                # A redirect: don't download its body, just note the target.
-                self._last_request = time.monotonic()
-                return ("redirect", (status, location))
+        try:
+            with self._client.stream(method, url, content=content, headers=headers) as resp:
+                status = resp.status_code
+                location = resp.headers.get("location")
+                if status in _REDIRECT_CODES and location:
+                    # A redirect: don't download its body, just note the target.
+                    return ("redirect", (status, location))
 
-            # Final response: read the body, capped. Keep bytes up to the cap
-            # (slicing the chunk that would cross it) rather than dropping a
-            # whole over-cap chunk, so `data` is exactly the first
-            # `max_body_bytes` received.
-            chunks: list[bytes] = []
-            total = 0
-            truncated = False
-            for chunk in resp.iter_bytes():
-                remaining = self.max_body_bytes - total
-                if len(chunk) <= remaining:
-                    chunks.append(chunk)
-                    total += len(chunk)
-                else:
-                    chunks.append(chunk[:remaining])  # fill up to the cap
-                    truncated = True
-                    break
-            data = b"".join(chunks)
-            elapsed = time.monotonic() - start
+                # Final response: read the body, capped. Keep bytes up to the cap
+                # (slicing the chunk that would cross it) rather than dropping a
+                # whole over-cap chunk, so `data` is exactly the first
+                # `max_body_bytes` received.
+                chunks: list[bytes] = []
+                total = 0
+                truncated = False
+                for chunk in resp.iter_bytes():
+                    remaining = self.max_body_bytes - total
+                    if len(chunk) <= remaining:
+                        chunks.append(chunk)
+                        total += len(chunk)
+                    else:
+                        chunks.append(chunk[:remaining])  # fill up to the cap
+                        truncated = True
+                        break
+                data = b"".join(chunks)
+                elapsed = time.monotonic() - start
+                # Decode defensively; sites lie about encodings.
+                encoding = resp.encoding or "utf-8"
+                text = data.decode(encoding, errors="replace")
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                # Preserve each Set-Cookie line (the dict above keeps only one).
+                set_cookies = list(resp.headers.get_list("set-cookie"))
+                return ("final", Response(
+                    url=str(resp.url),
+                    status=status,
+                    headers=resp_headers,
+                    text=text,
+                    elapsed=elapsed,
+                    set_cookies=set_cookies,
+                    content=data,
+                    encoding=encoding,
+                    truncated=truncated,
+                ))
+        finally:
+            # Space the NEXT attempt (including a retry) from this one, whether it
+            # succeeded, redirected, or raised a transient error — so the normal
+            # inter-request throttle applies before a retry even when a failed
+            # attempt returned quickly (e.g. a fast connection reset) and even if
+            # retry_backoff is 0.
             self._last_request = time.monotonic()
-            # Decode defensively; sites lie about encodings.
-            encoding = resp.encoding or "utf-8"
-            text = data.decode(encoding, errors="replace")
-            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            # Preserve each Set-Cookie line (the dict above keeps only one).
-            set_cookies = list(resp.headers.get_list("set-cookie"))
-            return ("final", Response(
-                url=str(resp.url),
-                status=status,
-                headers=resp_headers,
-                text=text,
-                elapsed=elapsed,
-                set_cookies=set_cookies,
-                content=data,
-                encoding=encoding,
-                truncated=truncated,
-            ))
 
     def get(self, path: str) -> Response:
         return self.request("GET", path)
