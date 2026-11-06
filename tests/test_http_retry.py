@@ -191,3 +191,37 @@ def test_transient_on_redirect_target_is_retried() -> None:
     c = _client(_h, max_retries=1)
     assert c.get("/a").status == 200
     assert state["n"] == 2              # /b retried after its transient error
+
+
+# -- transient DURING streamed body consumption (not only at send) -------
+
+class _RaisingStream(httpx.SyncByteStream):
+    """A response stream that raises a transient error when first iterated."""
+
+    def __init__(self, exc_factory, request):
+        self._exc_factory = exc_factory
+        self._request = request
+
+    def __iter__(self):
+        raise self._exc_factory(self._request)
+        yield b""  # pragma: no cover (make this a generator)
+
+    def close(self) -> None:
+        pass
+
+
+def test_timeout_during_body_read_is_retried() -> None:
+    calls = {"n": 0}
+
+    def _h(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 200 whose body raises a read timeout while being consumed.
+            return httpx.Response(200, stream=_RaisingStream(_read_timeout, request))
+        return httpx.Response(200, text="OK")
+
+    c = _client(_h, max_retries=1)
+    resp = c.get("/a")
+    assert resp.status == 200 and resp.text == "OK"
+    assert calls["n"] == 2            # the mid-stream failure was retried
+    assert c.request_count == 2
