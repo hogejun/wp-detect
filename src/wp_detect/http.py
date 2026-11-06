@@ -13,6 +13,11 @@ Design goals:
   * **Low impact.** A global request budget and a small inter-request delay
     keep the scanner from hammering a site; every redirect hop counts against
     the budget and is throttled too. This is a *detector*, not a stress tool.
+  * **Resilient, not aggressive.** A transient transport failure (connect/read
+    timeout, connection reset) is retried a small, bounded number of times
+    (default one) for idempotent methods, after an exponential backoff, so a
+    brief throttle window does not abort a whole check. Every attempt still
+    counts against the request budget, so retries never make a scan unbounded.
 """
 
 from __future__ import annotations
@@ -73,6 +78,26 @@ class TooManyRedirects(RuntimeError):
 
 # 3xx statuses that carry a Location we may follow (same-origin only).
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+# Transient transport failures that a single bounded retry may recover from:
+# connect/read/write/pool timeouts, connect failures, and read/write/remote-
+# protocol errors (a connection reset or a keep-alive connection the peer closed
+# mid-response). These are intermittent under per-IP rate limiting or a WAF; the
+# same request usually succeeds a moment later. NOT included: BudgetExceeded,
+# OffOriginRedirect, TooManyRedirects (our own control signals) and any HTTP
+# status (not an exception) — none of those are transport-transient.
+_TRANSIENT_ERRORS = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
+
+# Only idempotent methods are retried; replaying a non-idempotent request could
+# repeat a side effect. (This package only ever sends benign, action-free
+# requests, but the guard keeps the client correct for any caller.)
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 def _normalize_host(host: str) -> str:
@@ -272,6 +297,9 @@ class Client:
         verify_tls: bool = True,
         user_agent: str = DEFAULT_USER_AGENT,
         max_body_bytes: int = 1_000_000,
+        max_retries: int = 1,
+        retry_backoff: float = 0.5,
+        retry_backoff_max: float = 4.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/") + "/"
@@ -282,6 +310,15 @@ class Client:
         self.max_requests = max_requests
         self.max_redirects = max_redirects
         self.max_body_bytes = max_body_bytes
+        # Bounded retry for transient transport errors (see _TRANSIENT_ERRORS):
+        # at most ``max_retries`` extra attempts per request, each after an
+        # exponential backoff of ``retry_backoff * 2**n`` seconds capped at
+        # ``retry_backoff_max``. Default is one retry — enough to ride out a brief
+        # throttle window, small enough not to mask a real failure or amplify load.
+        # Every attempt (including a retry) still counts against ``max_requests``.
+        self.max_retries = max(0, max_retries)
+        self.retry_backoff = max(0.0, retry_backoff)
+        self.retry_backoff_max = max(0.0, retry_backoff_max)
         self.request_count = 0
         self._last_request = 0.0
         self._client = httpx.Client(
@@ -342,6 +379,17 @@ class Client:
         if _origin(url) != self._origin:
             raise OffOriginRedirect("refusing off-origin request")
 
+    def _backoff_sleep(self, attempt: int) -> None:
+        """Wait before retry number ``attempt`` (1-based): an exponential backoff
+        ``retry_backoff * 2**(attempt-1)`` capped at ``retry_backoff_max``. This
+        is in addition to the normal inter-request throttle the retry will also
+        apply, so a retry waits a moment for a throttle window to pass."""
+        if self.retry_backoff <= 0:
+            return
+        wait = min(self.retry_backoff_max, self.retry_backoff * (2 ** (attempt - 1)))
+        if wait > 0:
+            time.sleep(wait)
+
     def _send(
         self,
         method: str,
@@ -359,79 +407,106 @@ class Client:
         visited = {url}
         hops = 0
 
+        # Redirect loop. Each hop is a network attempt that may be retried on a
+        # transient transport error; redirect-chain enforcement (hop limit, origin,
+        # loop detection, 303/body handling) stays here, outside the retry.
         while True:
-            if self.request_count >= self.max_requests:
-                raise BudgetExceeded(
-                    f"request budget of {self.max_requests} exhausted"
-                )
-            self._throttle()
-            self.request_count += 1
-            start = time.monotonic()
-            headers = {"Content-Type": content_type} if content_type else None
-            with self._client.stream(
-                method, url, content=content, headers=headers
-            ) as resp:
-                status = resp.status_code
-                location = resp.headers.get("location")
-                if status in _REDIRECT_CODES and location:
-                    # A redirect: don't download its body, just note the target.
-                    self._last_request = time.monotonic()
-                    hops += 1
-                    if hops > self.max_redirects:
-                        # Neither the request path nor the redirect target is
-                        # echoed — a Location/path may carry a token.
-                        raise TooManyRedirects(
-                            f"exceeded {self.max_redirects} redirects"
-                        )
-                    next_url = urljoin(url, location)
-                    self._check_origin(next_url)
-                    if next_url in visited:
-                        raise TooManyRedirects("redirect loop detected")
-                    visited.add(next_url)
-                    # Never replay a body across a redirect; 303 forces GET.
-                    if content is not None or status == 303:
-                        method = "GET"
-                        content = None
-                        content_type = None
-                    url = next_url
-                    continue
+            kind, payload = self._attempt_with_retry(method, url, content, content_type)
+            if kind == "final":
+                return payload  # type: ignore[return-value]
+            status, location = payload  # type: ignore[misc]
+            hops += 1
+            if hops > self.max_redirects:
+                # Neither the request path nor the redirect target is echoed —
+                # a Location/path may carry a token.
+                raise TooManyRedirects(f"exceeded {self.max_redirects} redirects")
+            next_url = urljoin(url, location)
+            self._check_origin(next_url)
+            if next_url in visited:
+                raise TooManyRedirects("redirect loop detected")
+            visited.add(next_url)
+            # Never replay a body across a redirect; 303 forces GET.
+            if content is not None or status == 303:
+                method = "GET"
+                content = None
+                content_type = None
+            url = next_url
 
-                # Final response: read the body, capped. Keep bytes up to the cap
-                # (slicing the chunk that would cross it) rather than dropping a
-                # whole over-cap chunk, so `data` is exactly the first
-                # `max_body_bytes` received.
-                chunks: list[bytes] = []
-                total = 0
-                truncated = False
-                for chunk in resp.iter_bytes():
-                    remaining = self.max_body_bytes - total
-                    if len(chunk) <= remaining:
-                        chunks.append(chunk)
-                        total += len(chunk)
-                    else:
-                        chunks.append(chunk[:remaining])  # fill up to the cap
-                        truncated = True
-                        break
-                data = b"".join(chunks)
-                elapsed = time.monotonic() - start
+    def _attempt_with_retry(self, method, url, content, content_type):  # type: ignore[no-untyped-def]
+        """One network attempt to ``url`` with a bounded transient-error retry.
+
+        Returns ``("final", Response)`` or ``("redirect", (status, location))``.
+        A transient transport error (``_TRANSIENT_ERRORS``) is retried up to
+        ``max_retries`` times for idempotent methods only, after an exponential
+        backoff. Non-transient failures — BudgetExceeded, off-origin/too-many
+        redirects, any HTTP status — are not caught here and propagate unchanged.
+        A retried attempt is counted against the budget by ``_attempt_once``."""
+        attempt = 0
+        while True:
+            try:
+                return self._attempt_once(method, url, content, content_type)
+            except _TRANSIENT_ERRORS:
+                if attempt >= self.max_retries or method.upper() not in _IDEMPOTENT_METHODS:
+                    raise
+                attempt += 1
+                self._backoff_sleep(attempt)
+
+    def _attempt_once(self, method, url, content, content_type):  # type: ignore[no-untyped-def]
+        """Send one request and either note a redirect or read the final body.
+
+        Budget and throttle apply to every attempt (so a retry still counts).
+        Raises a ``_TRANSIENT_ERRORS`` member if the transport fails; the caller
+        decides whether to retry."""
+        if self.request_count >= self.max_requests:
+            raise BudgetExceeded(f"request budget of {self.max_requests} exhausted")
+        self._throttle()
+        self.request_count += 1
+        start = time.monotonic()
+        headers = {"Content-Type": content_type} if content_type else None
+        with self._client.stream(method, url, content=content, headers=headers) as resp:
+            status = resp.status_code
+            location = resp.headers.get("location")
+            if status in _REDIRECT_CODES and location:
+                # A redirect: don't download its body, just note the target.
                 self._last_request = time.monotonic()
-                # Decode defensively; sites lie about encodings.
-                encoding = resp.encoding or "utf-8"
-                text = data.decode(encoding, errors="replace")
-                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-                # Preserve each Set-Cookie line (the dict above keeps only one).
-                set_cookies = list(resp.headers.get_list("set-cookie"))
-                return Response(
-                    url=str(resp.url),
-                    status=status,
-                    headers=resp_headers,
-                    text=text,
-                    elapsed=elapsed,
-                    set_cookies=set_cookies,
-                    content=data,
-                    encoding=encoding,
-                    truncated=truncated,
-                )
+                return ("redirect", (status, location))
+
+            # Final response: read the body, capped. Keep bytes up to the cap
+            # (slicing the chunk that would cross it) rather than dropping a
+            # whole over-cap chunk, so `data` is exactly the first
+            # `max_body_bytes` received.
+            chunks: list[bytes] = []
+            total = 0
+            truncated = False
+            for chunk in resp.iter_bytes():
+                remaining = self.max_body_bytes - total
+                if len(chunk) <= remaining:
+                    chunks.append(chunk)
+                    total += len(chunk)
+                else:
+                    chunks.append(chunk[:remaining])  # fill up to the cap
+                    truncated = True
+                    break
+            data = b"".join(chunks)
+            elapsed = time.monotonic() - start
+            self._last_request = time.monotonic()
+            # Decode defensively; sites lie about encodings.
+            encoding = resp.encoding or "utf-8"
+            text = data.decode(encoding, errors="replace")
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            # Preserve each Set-Cookie line (the dict above keeps only one).
+            set_cookies = list(resp.headers.get_list("set-cookie"))
+            return ("final", Response(
+                url=str(resp.url),
+                status=status,
+                headers=resp_headers,
+                text=text,
+                elapsed=elapsed,
+                set_cookies=set_cookies,
+                content=data,
+                encoding=encoding,
+                truncated=truncated,
+            ))
 
     def get(self, path: str) -> Response:
         return self.request("GET", path)
