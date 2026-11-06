@@ -10,7 +10,12 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 pattern="$(cat "$here/forbidden.txt")"
+# The author must always be the project's noreply identity. The committer may
+# also be GitHub's web-flow identity, which GitHub sets on the commit it creates
+# for a squash/merge performed through the web UI or `gh pr merge` — the standard
+# way changes land here. Neither identity carries a real name or address.
 allowed='hogejun <7918106+hogejun@users.noreply.github.com>'
+webflow_committer='GitHub <noreply@github.com>'
 
 if [ -n "${RANGE:-}" ]; then
   revs="$RANGE"
@@ -32,12 +37,16 @@ fi
 
 fail=0
 while IFS= read -r sha; do
-  # 1) author AND committer must be exactly the one allowed noreply identity
-  while IFS= read -r id; do
-    if [ "$id" != "$allowed" ]; then
-      echo "::error::${sha:0:12}: disallowed identity: $id"; fail=1
-    fi
-  done < <(git show -s --format='%an <%ae>%n%cn <%ce>' "$sha")
+  # 1) the author must be exactly the allowed noreply identity; the committer
+  #    must be that, or GitHub's web-flow identity (squash/merge commits).
+  author="$(git show -s --format='%an <%ae>' "$sha")"
+  committer="$(git show -s --format='%cn <%ce>' "$sha")"
+  if [ "$author" != "$allowed" ]; then
+    echo "::error::${sha:0:12}: disallowed author: $author"; fail=1
+  fi
+  if [ "$committer" != "$allowed" ] && [ "$committer" != "$webflow_committer" ]; then
+    echo "::error::${sha:0:12}: disallowed committer: $committer"; fail=1
+  fi
 
   body="$(git show -s --format='%B' "$sha")"
   # 2) no identity trailers at all (public policy: a single noreply identity,
